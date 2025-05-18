@@ -26,8 +26,15 @@ async function getDbCredentials() {
         password: dbPassword,
         database: dbName,
         port: parseInt(dbPort, 10), // Ensure port is an integer
+        ssl: { 
+            rejectUnauthorized: true 
+            // For RDS, typically AWS provides a CA bundle that system truststores might already have.
+            // If you encounter "self-signed certificate" or similar errors after this change,
+            // you may need to download the AWS RDS CA certificate and provide it:
+            // ca: fs.readFileSync('/path/to/your/aws-rds-ca.pem').toString(),
+        }
     };
-    console.log("[DB_INIT] Successfully loaded DB credentials. Host:", credentials.host, "User:", credentials.user, "DB:", credentials.database, "Port:", credentials.port);
+    console.log("[DB_INIT] Successfully loaded DB credentials. Host:", credentials.host, "User:", credentials.user, "DB:", credentials.database, "Port:", credentials.port, "SSL rejectUnauthorized:", credentials.ssl.rejectUnauthorized);
     return credentials;
 }
 
