@@ -1,92 +1,23 @@
 require('dotenv').config(); // Load environment variables from .env file
+const fs = require('fs'); // Import the fs module
 
-const express = require('express');
-const { Pool } = require('pg');
+const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
+const { DynamoDBDocumentClient, PutCommand, ScanCommand } = require('@aws-sdk/lib-dynamodb');
 
-let pool;
-
-async function getDbCredentials() {
-    console.log("[DB_INIT] Attempting to load DB credentials from environment variables...");
-    const dbHost = process.env.DB_HOST;
-    const dbUser = process.env.DB_USER;
-    const dbPassword = process.env.DB_PASSWORD;
-    const dbName = process.env.DB_NAME || 'stockdata'; // Default to stockdata if not in .env
-    const dbPort = process.env.DB_PORT || 5432;     // Default to 5432 if not in .env
-
-    if (!dbHost || !dbUser || !dbPassword || !dbName) {
-        const errorMessage = "[DB_INIT_ERROR] Missing one or more required DB credentials in .env file (DB_HOST, DB_USER, DB_PASSWORD, DB_NAME).";
-        console.error(errorMessage);
-        console.error("[DB_INIT_ERROR] Current values - DB_HOST:", dbHost, "DB_USER:", dbUser, "DB_NAME:", dbName, "DB_PORT:", dbPort);
-        throw new Error(errorMessage);
+// Initialize DynamoDB client
+const client = new DynamoDBClient({
+    region: process.env.AWS_REGION || 'us-east-1',
+    credentials: {
+        accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
     }
+});
 
-    const credentials = {
-        host: dbHost,
-        user: dbUser,
-        password: dbPassword,
-        database: dbName,
-        port: parseInt(dbPort, 10), // Ensure port is an integer
-        ssl: { 
-            rejectUnauthorized: true 
-            // For RDS, typically AWS provides a CA bundle that system truststores might already have.
-            // If you encounter "self-signed certificate" or similar errors after this change,
-            // you may need to download the AWS RDS CA certificate and provide it:
-            // ca: fs.readFileSync('/path/to/your/aws-rds-ca.pem').toString(),
-        }
-    };
-    console.log("[DB_INIT] Successfully loaded DB credentials. Host:", credentials.host, "User:", credentials.user, "DB:", credentials.database, "Port:", credentials.port, "SSL rejectUnauthorized:", credentials.ssl.rejectUnauthorized);
-    return credentials;
-}
-
-async function initializePool() {
-    console.log("[DB_INIT] Initializing database connection pool...");
-    try {
-        const dbCredentials = await getDbCredentials(); // No longer needs to be async, but kept for consistency
-        
-        pool = new Pool(dbCredentials);
-        console.log(`[DB_INIT] Connection pool created for database '${dbCredentials.database}'. Attempting to connect...`);
-
-        const client = await pool.connect();
-        console.log(`[DB_INIT] Successfully connected to database '${dbCredentials.database}' on host '${dbCredentials.host}'.`);
-        try {
-            await client.query('SELECT NOW()');
-            console.log("[DB_INIT] Database connection test query successful.");
-
-            const createTableQuery = `
-                CREATE TABLE IF NOT EXISTS stock_analysis_results (
-                    symbol VARCHAR(10) NOT NULL,
-                    price NUMERIC NULL,
-                    volume BIGINT NULL,
-                    pe_ratio NUMERIC NULL,
-                    dividend_yield NUMERIC NULL,
-                    one_year_target NUMERIC NULL,
-                    news_summaries_json TEXT NULL,
-                    last_analysis_timestamp TIMESTAMP WITHOUT TIME ZONE NULL DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'UTC'::text)
-                );
-            `;
-            console.log("[DB_INIT] Executing CREATE TABLE IF NOT EXISTS for 'stock_analysis_results'...");
-            await client.query(createTableQuery);
-            console.log("[DB_INIT] 'stock_analysis_results' table checked/created successfully.");
-
-        } finally {
-            client.release();
-            console.log("[DB_INIT] Database client released.");
-        }
-        console.log("[DB_INIT] Database pool initialization and table setup complete.");
-    } catch (error) {
-        console.error("[DB_INIT_ERROR] Critical error during database pool initialization or table setup:", error.message);
-        // Log the full error object if more details are needed, especially the original error if wrapped.
-        // console.error(error); 
-        process.exit(1);
-    }
-}
-
-initializePool();
+const docClient = DynamoDBDocumentClient.from(client);
+const TABLE_NAME = 'stock_analysis_results';
 
 const put_stocks = async (req, res) => {
     console.log(`[PUT /api/stocks] Received request at ${new Date().toISOString()}`);
-    // Sensitive data logging: For development, req.body can be logged.
-    // In production, be cautious about logging sensitive PII or credentials.
     console.log("[PUT /api/stocks] Request body:", JSON.stringify(req.body, null, 2));
 
     const { 
@@ -100,73 +31,62 @@ const put_stocks = async (req, res) => {
         last_analysis_timestamp 
     } = req.body;
 
-    if (!pool) {
-        console.error("[PUT /api/stocks] ERROR: Database pool not initialized.");
-        return res.status(500).json({ error: "Database connection not available. Please check server logs." });
-    }
-
     if (!symbol) {
         console.warn("[PUT /api/stocks] Validation Error: Missing required field: symbol.");
         return res.status(400).json({ error: "Missing required field: symbol." });
     }
-    
-    const insertQuery = 
-        'INSERT INTO stock_analysis_results ( ' +
-        '    symbol, price, volume, pe_ratio, dividend_yield, ' +
-        '    one_year_target, news_summaries_json, last_analysis_timestamp' +
-        ') VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ' +
-        'RETURNING *;';
 
-    const values = [
-        symbol, price, volume, pe_ratio, 
-        divident_yield, // Mapped to dividend_yield column
-        one_year_target, news_summaries_json, last_analysis_timestamp
-    ];
-    console.log("[PUT /api/stocks] Attempting to insert values:", JSON.stringify(values)); // Stringify for better array logging
+    // Generate timestamp if not provided
+    const timestamp = last_analysis_timestamp || new Date().toISOString();
 
-    let client;
+    const item = {
+        symbol,
+        timestamp, // This will be the sort key
+        price: price ? Number(price) : null,
+        volume: volume ? Number(volume) : null,
+        pe_ratio: pe_ratio ? Number(pe_ratio) : null,
+        dividend_yield: divident_yield ? Number(divident_yield) : null,
+        one_year_target: one_year_target ? Number(one_year_target) : null,
+        news_summaries_json
+    };
+
     try {
-        client = await pool.connect();
-        console.log("[PUT /api/stocks] Database client acquired from pool.");
-        const result = await client.query(insertQuery, values);
-        console.log("[PUT /api/stocks] Successfully inserted data. Rows affected:", result.rowCount, "Data:", JSON.stringify(result.rows[0]));
-        res.status(201).json({ message: "Stock data saved successfully to stock_analysis_results.", data: result.rows[0] });
+        const command = new PutCommand({
+            TableName: TABLE_NAME,
+            Item: item
+        });
+
+        await docClient.send(command);
+        console.log("[PUT /api/stocks] Successfully inserted data:", JSON.stringify(item));
+        res.status(201).json({ 
+            message: "Stock data saved successfully to stock_analysis_results.", 
+            data: item 
+        });
     } catch (err) {
-        console.error("[PUT /api/stocks] ERROR saving stock data to RDS:", err.message);
-        // console.error(err); // Uncomment for full error stack
+        console.error("[PUT /api/stocks] ERROR saving stock data to DynamoDB:", err.message);
         res.status(500).json({ error: "Failed to save stock data.", details: err.message });
-    } finally {
-        if (client) {
-            client.release();
-            console.log("[PUT /api/stocks] Database client released.");
-        }
     }
 };
 
 const get_stocks = async (req, res) => {
     console.log(`[GET /api/stocks] Received request at ${new Date().toISOString()}`);
-    if (!pool) {
-        console.error("[GET /api/stocks] ERROR: Database pool not initialized.");
-        return res.status(500).json({ error: "Database connection not available." });
-    }
     
-    console.log("[GET /api/stocks] Attempting to fetch data from 'stock_analysis_results'...");
-    let client;
     try {
-        client = await pool.connect();
-        console.log("[GET /api/stocks] Database client acquired from pool.");
-        const result = await client.query('SELECT * FROM stock_analysis_results LIMIT 100');
-        console.log("[GET /api/stocks] Successfully fetched data. Row count:", result.rowCount);
-        res.status(200).json(result.rows);
+        const command = new ScanCommand({
+            TableName: TABLE_NAME,
+            Limit: 100
+        });
+
+        const result = await docClient.send(command);
+        // Sort items by timestamp in descending order (newest first)
+        const sortedItems = result.Items.sort((a, b) => 
+            new Date(b.timestamp) - new Date(a.timestamp)
+        );
+        console.log("[GET /api/stocks] Successfully fetched data. Item count:", sortedItems.length);
+        res.status(200).json(sortedItems);
     } catch (error) {
         console.error("[GET /api/stocks] ERROR fetching stocks:", error.message);
-        // console.error(error); // Uncomment for full error stack
         res.status(500).json({ error: "Failed to retrieve stocks.", details: error.message });
-    } finally {
-        if (client) {
-            client.release();
-            console.log("[GET /api/stocks] Database client released.");
-        }
     }
 };
 
